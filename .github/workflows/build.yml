@@ -1,0 +1,53 @@
+name: Build
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Windows x64
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ReShade 头文件（v6.8.0）+ MinHook，下载到 third_party/
+      - name: Fetch dependencies
+        shell: pwsh
+        run: ./scripts/fetch-deps.ps1
+
+      - name: Configure
+        run: cmake -S . -B build -A x64
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Verify output
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dll = Get-ChildItem -Recurse -Filter '*.addon64' | Select-Object -First 1
+          if (-not $dll) { throw 'ReShade_PreUI_FSR.addon64 was not produced' }
+          Write-Host "built: $($dll.FullName) ($($dll.Length) bytes)"
+          (Get-FileHash $dll.FullName -Algorithm SHA256).Hash
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ReShade_PreUI_FSR
+          path: |
+            build/Release/*.addon64
+            build/*.addon64
+          if-no-files-found: error
+          retention-days: 30

@@ -1,0 +1,156 @@
+name: Release
+
+# 用法：git tag v0.1 && git push origin v0.1
+# tag 写 v0.1 或 v0.1.0 都可以，会归一化成 0.1.0 后与 CMake 的 VERSION 比较。
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '要（重新）发布的 tag，例如 v0.1'
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build & publish
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: ver
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          function Normalize-Version([string] $v) {
+            $p = @((($v.Trim()) -replace '^[vV]', '') -split '\.')
+            while ($p.Count -lt 3) { $p += '0' }
+            return ($p[0..2] -join '.')
+          }
+
+          $tag = if ('${{ github.event.inputs.tag }}' -ne '') { '${{ github.event.inputs.tag }}' } else { $env:GITHUB_REF_NAME }
+
+          $cmake = Get-Content 'CMakeLists.txt' -Raw
+          if ($cmake -notmatch 'project\s*\(\s*reshade_preui_fsr3\s+VERSION\s+([0-9]+(\.[0-9]+)*)') {
+            throw 'cannot read VERSION from CMakeLists.txt'
+          }
+
+          $cmakeVer = Normalize-Version $Matches[1]
+          $tagVer   = Normalize-Version $tag
+
+          if ($tagVer -ne $cmakeVer) {
+            throw "tag '$tag' (=> $tagVer) does not match CMakeLists.txt VERSION ($cmakeVer)."
+          }
+
+          Write-Host "releasing $tag (version $cmakeVer)"
+          "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "version=$cmakeVer" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Fetch dependencies
+        shell: pwsh
+        run: ./scripts/fetch-deps.ps1
+
+      - name: Configure
+        run: cmake -S . -B build -A x64
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ver = '${{ steps.ver.outputs.version }}'
+
+          $dll = Get-ChildItem -Recurse -Filter '*.addon64' | Select-Object -First 1
+          if (-not $dll) { throw 'ReShade_PreUI_FSR.addon64 was not produced' }
+
+          $stage = 'stage'
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item $dll.FullName (Join-Path $stage 'ReShade_PreUI_FSR.addon64')
+          Copy-Item 'PreUI_FSR.ini'          $stage
+          Copy-Item 'README.md'              $stage
+          Copy-Item 'CHANGELOG.md'           $stage
+          Copy-Item 'LICENSE'                $stage
+          Copy-Item 'THIRD_PARTY_NOTICES.md' $stage
+          Set-Content -Path (Join-Path $stage 'VERSION.txt') -Value "v$ver" -NoNewline
+
+          $zip = "ReShade_PreUI_FSR-v$ver.zip"
+          Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $zip -Force
+          Write-Host "packaged $zip ($((Get-Item $zip).Length) bytes)"
+          (Get-FileHash $zip -Algorithm SHA256).Hash
+
+      - name: Write release body
+        shell: pwsh
+        run: |
+          @'
+          ## 这是什么
+
+          FSR 3 版本的 ReShade Pre-UI add-on：把 ReShade 的 `.fx` 效果画到 **UI 合成之前** 的
+          3D 画面上，UI 不受滤镜影响。适用于用 **AMD FSR 3** 做升采样 / 锐化的游戏。
+
+          ## 安装
+
+          1. 确认游戏目录里已经装好 **ReShade 6.8.0**（`dxgi.dll` 或 `d3d12.dll`）。
+          2. 把压缩包里的 `ReShade_PreUI_FSR.addon64` 和 `PreUI_FSR.ini` 解压到**游戏 exe 同目录**。
+          3. 进游戏，在视频设置里把升采样切成 **FSR 3**（不要用 DLSS / XeSS），进实际场景。
+          4. 打开 ReShade 面板勾一个滤镜：**只有 3D 画面变色、UI 不变**就是生效了。
+
+          ## 首次运行会生成
+
+          `PreUI-FSR.log`。重点看这几行：
+
+          - `target ...!ffxDispatch -> 0x...` —— 钩子挂上了
+          - `commandList offset resolved: 16` —— desc 布局识别成功（16 = 新 FFX API）
+          - `cand[k] off=… fmt=… bpp=…` —— 每个候选资源的真实描述
+          - `output resolved: off=328 … fmt=10` —— 选中了 HDR 场景色（`fmt=10`）
+          - `injected N frames (… fmt=10)` —— 逐帧注入成功
+
+          如果 `injected` 里的 `fmt` 是 61（R8）之类的单通道格式，说明挑错了资源，
+          把 `cand[...]` 和 `FfxDispatchDescription dump` 贴到 Issue 即可人工校准
+          （也可以自己数出 `width` 的偏移填进 `PreUI_FSR.ini` 的 `OutputOffset=`）。
+
+          ## 注意
+
+          - **必须是 FSR 3 的 DLL 版**（`amd_fidelityfx_dx12.dll` 或
+            `amd_fidelityfx_upscaler_dx12.dll`）。如果游戏把 FSR 静态编进了 exe，
+            本 add-on 找不到注入点（日志的 `module:` 列表会显示）。
+          - 不支持 FSR 帧生成 / 降噪，那两次 dispatch 会被自动跳过。
+          - 注入 DLL 进在线游戏存在账号风险，请自行评估。
+          - N 卡也能跑 FSR 3，可以先用 N 卡验证，再到 A 卡上确认。
+
+          完整说明见 `README.md`。
+          '@ | Set-Content -Path 'release-body.md' -Encoding utf8
+
+      - name: Create GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $tag = '${{ steps.ver.outputs.tag }}'
+          $ver = '${{ steps.ver.outputs.version }}'
+          $zip = "ReShade_PreUI_FSR-v$ver.zip"
+
+          gh release create $tag $zip `
+            --title "ReShade Pre-UI FSR3 v$ver" `
+            --notes-file release-body.md `
+            --verify-tag
+          if ($LASTEXITCODE -eq 0) { exit 0 }
+
+          Write-Host 'release already exists, uploading asset instead'
+          gh release upload $tag $zip --clobber
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          gh release edit $tag --notes-file release-body.md
+          exit $LASTEXITCODE

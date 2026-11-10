@@ -1,0 +1,39 @@
+# ---- 构建产物 ----
+build/
+out/
+dist/
+stage/
+release-body.md
+cmake-build-*/
+CMakeCache.txt
+CMakeFiles/
+CMakeUserPresets.json
+
+# ---- MSVC / VS ----
+*.sln
+*.vcxproj
+*.vcxproj.*
+*.user
+*.suo
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.obj
+*.idb
+
+# ---- 二进制（从源码构建，不入库） ----
+*.addon64
+*.dll
+
+# ---- 运行期日志 ----
+*.log
+
+# ---- 编辑器 / 系统 ----
+.vs/
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+desktop.ini
+.DS_Store
